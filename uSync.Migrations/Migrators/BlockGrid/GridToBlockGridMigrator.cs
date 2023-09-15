@@ -5,8 +5,9 @@ using Newtonsoft.Json.Linq;
 using Umbraco.Cms.Core.Logging;
 using Umbraco.Cms.Core.Models;
 using Umbraco.Cms.Core.PropertyEditors;
+using Umbraco.Cms.Core.Services;
 using Umbraco.Cms.Core.Strings;
-
+using uSync.Migrations.Configuration;
 using uSync.Migrations.Context;
 using uSync.Migrations.Legacy.Grid;
 using uSync.Migrations.Migrators.BlockGrid.BlockMigrators;
@@ -23,25 +24,34 @@ public class GridToBlockGridMigrator : SyncPropertyMigratorBase
 {
 	private readonly ILegacyGridConfig _gridConfig;
 	private readonly SyncBlockMigratorCollection _blockMigrators;
+	private readonly GridSettingsViewMigratorCollection _gridSettingsMigrators;
 	private readonly ILoggerFactory _loggerFactory;
 	private readonly ILogger<GridToBlockGridMigrator> _logger;
 	private readonly IProfilingLogger _profilingLogger;
-
 	private readonly GridConventions _conventions;
+	private readonly IContentTypeService _contentTypeService;
+	private readonly IDataTypeService _dataTypeService;
 
     public GridToBlockGridMigrator(
         ILegacyGridConfig gridConfig,
         SyncBlockMigratorCollection blockMigrators,
+		GridSettingsViewMigratorCollection gridSettingsMigrators,
         IShortStringHelper shortStringHelper,
         ILoggerFactory loggerFactory,
-        IProfilingLogger profilingLogger)
+        IProfilingLogger profilingLogger,
+		IContentTypeService contentTypeService,
+		IDataTypeService dataTypeService
+		)
     {
         _gridConfig = gridConfig;
         _blockMigrators = blockMigrators;
+		_gridSettingsMigrators = gridSettingsMigrators;
         _conventions = new GridConventions(shortStringHelper);
         _loggerFactory = loggerFactory;
         _profilingLogger = profilingLogger;
-        _logger = loggerFactory.CreateLogger<GridToBlockGridMigrator>();	
+		_logger = loggerFactory.CreateLogger<GridToBlockGridMigrator>();
+		_contentTypeService = contentTypeService;
+		_dataTypeService = dataTypeService;
     }
 
     public override string GetEditorAlias(SyncMigrationDataTypeProperty dataTypeProperty, SyncMigrationContext context)
@@ -52,6 +62,7 @@ public class GridToBlockGridMigrator : SyncPropertyMigratorBase
 
 	public override object? GetConfigValues(SyncMigrationDataTypeProperty dataTypeProperty, SyncMigrationContext context)
 	{
+		//migrationDataTypeProperty = dataTypeProperty;	
         _logger.LogDebug(">> {method}", nameof(GetConfigValues));
 
         if (dataTypeProperty.ConfigAsString == null)
@@ -75,12 +86,16 @@ public class GridToBlockGridMigrator : SyncPropertyMigratorBase
 
 		var contentBlockHelper = new GridToBlockGridConfigBlockHelper(_blockMigrators, _loggerFactory.CreateLogger<GridToBlockGridConfigBlockHelper>());
 		var layoutBlockHelper = new GridToBlockGridConfigLayoutBlockHelper(_conventions, _loggerFactory.CreateLogger<GridToBlockGridConfigLayoutBlockHelper>());
+        var layoutSettingsBlockHelper = new GridToBlockGridConfigLayoutSettingsHelper(_conventions, _gridSettingsMigrators, _loggerFactory.CreateLogger<GridToBlockGridConfigLayoutSettingsHelper>());
 
 		// adds content types for the core elements (headline, rte, etc)
 		contentBlockHelper.AddConfigDataTypes(gridToBlockContext, context);
+		
+		// Add settings
+		layoutSettingsBlockHelper.AddGridSettings(gridToBlockContext, context, dataTypeProperty.DataTypeAlias);
 
 		// prep the layouts 
-		layoutBlockHelper.AddLayoutBlocks(gridToBlockContext, context);
+		layoutBlockHelper.AddLayoutBlocks(gridToBlockContext, context, dataTypeProperty.DataTypeAlias);
 
 		// Add the content blocks
 		contentBlockHelper.AddContentBlocks(gridToBlockContext, context);
@@ -105,7 +120,22 @@ public class GridToBlockGridMigrator : SyncPropertyMigratorBase
 	{
 		_logger.LogDebug(">> {method}", nameof(GetContentValue));
 
-		if (string.IsNullOrWhiteSpace(contentProperty.Value))
+		var gridDataTypeId = _contentTypeService.Get(contentProperty.ContentTypeAlias)?.PropertyTypes
+			.Where(propertyType => propertyType.PropertyEditorAlias == contentProperty.EditorAlias && propertyType.Alias == contentProperty.PropertyAlias)
+			.Select(propertyType => propertyType.DataTypeId)
+			.FirstOrDefault();
+
+		var dataTypeAlias = "";
+		if (gridDataTypeId is not null)
+		{
+			dataTypeAlias = _dataTypeService.GetDataType((int)gridDataTypeId)?.Name;
+        }
+		else
+		{
+			_logger.LogWarning("  Data type for grid could not be found when converting {alias}. Migration will run, but layout setting will not be migrated.", contentProperty.EditorAlias);
+		}
+
+        if (string.IsNullOrWhiteSpace(contentProperty.Value))
 		{
 			_logger.LogDebug("  Content property is blank, nothing to migrate");
 			return string.Empty;
@@ -149,8 +179,10 @@ public class GridToBlockGridMigrator : SyncPropertyMigratorBase
 			_blockMigrators,
 			_loggerFactory.CreateLogger<GridToBlockContentHelper>(), 
 			_profilingLogger);
-		
-		var blockValue = helper.ConvertToBlockValue(source, context);
+
+
+
+		var blockValue = helper.ConvertToBlockValue(source, context, dataTypeAlias ?? "");
 		if (blockValue == null)
 		{
 			_logger.LogDebug("  Converted value for {alias} is empty", contentProperty.EditorAlias);
